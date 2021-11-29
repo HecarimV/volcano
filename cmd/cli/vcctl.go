@@ -48,6 +48,7 @@ func main() {
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
 
 	rootCmd.AddCommand(buildJobCmd())
+	rootCmd.AddCommand(buildJobTemplateCmd())
 	rootCmd.AddCommand(buildQueueCmd())
 	rootCmd.AddCommand(versionCommand())
 
