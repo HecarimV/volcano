@@ -73,7 +73,7 @@ type Session struct {
 	preemptableFns    map[string]api.EvictableFn
 	reclaimableFns    map[string]api.EvictableFn
 	overusedFns       map[string]api.ValidateFn
-	underUsedFns      map[string]api.UnderUsedResourceFn
+	allocatableFns    map[string]api.AllocatableFn
 	jobReadyFns       map[string]api.ValidateFn
 	jobPipelinedFns   map[string]api.VoteFn
 	jobValidFns       map[string]api.ValidateExFn
@@ -115,7 +115,7 @@ func openSession(cache cache.Cache) *Session {
 		preemptableFns:    map[string]api.EvictableFn{},
 		reclaimableFns:    map[string]api.EvictableFn{},
 		overusedFns:       map[string]api.ValidateFn{},
-		underUsedFns:      map[string]api.UnderUsedResourceFn{},
+		allocatableFns:    map[string]api.AllocatableFn{},
 		jobReadyFns:       map[string]api.ValidateFn{},
 		jobPipelinedFns:   map[string]api.VoteFn{},
 		jobValidFns:       map[string]api.ValidateExFn{},
@@ -206,6 +206,9 @@ func jobStatus(ssn *Session, jobInfo *api.JobInfo) scheduling.PodGroupStatus {
 	// If running tasks && unschedulable, unknown phase
 	if len(jobInfo.TaskStatusIndex[api.Running]) != 0 && unschedulable {
 		status.Phase = scheduling.PodGroupUnknown
+		if jobInfo.CustomLaunch {
+			status.Phase = scheduling.PodGroupInqueue
+		}
 	} else {
 		allocated := 0
 		for status, tasks := range jobInfo.TaskStatusIndex {
@@ -217,6 +220,9 @@ func jobStatus(ssn *Session, jobInfo *api.JobInfo) scheduling.PodGroupStatus {
 		// If there're enough allocated resource, it's running
 		if int32(allocated) >= jobInfo.PodGroup.Spec.MinMember {
 			status.Phase = scheduling.PodGroupRunning
+			if jobInfo.CustomLaunch && int32(allocated) < jobInfo.TaskMinAvailableTotal {
+				status.Phase = scheduling.PodGroupInqueue
+			}
 		} else if jobInfo.PodGroup.Status.Phase != scheduling.PodGroupInqueue {
 			status.Phase = scheduling.PodGroupPending
 		}

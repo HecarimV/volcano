@@ -59,9 +59,14 @@ func (db *DisruptionBudget) Clone() *DisruptionBudget {
 	}
 }
 
-// JobWaitingTime is maximum waiting time that a job could stay Pending in service level agreement
-// when job waits longer than waiting time, it should be inqueue at once, and cluster should reserve resources for it
-const JobWaitingTime = "sla-waiting-time"
+const (
+	// JobWaitingTime is maximum waiting time that a job could stay Pending in service level agreement
+	// when job waits longer than waiting time, it should be inqueue at once, and cluster should reserve resources for it
+	JobWaitingTime = "sla-waiting-time"
+	// CustomLaunch represents whether the job needs a custom launch
+	// true indicates that there is a dependency between tasks
+	CustomLaunch = "volcano.sh/custom-launch"
+)
 
 // TaskID is UID type for Task
 type TaskID types.UID
@@ -309,6 +314,7 @@ type JobInfo struct {
 
 	// All tasks of the Job.
 	TaskStatusIndex       map[TaskStatus]tasksMap
+	TaskStatusCount       map[TaskID]map[TaskStatus]int32
 	Tasks                 tasksMap
 	TaskMinAvailable      map[TaskID]int32
 	TaskMinAvailableTotal int32
@@ -321,7 +327,8 @@ type JobInfo struct {
 
 	ScheduleStartTimestamp metav1.Time
 
-	Preemptable bool
+	Preemptable  bool
+	CustomLaunch bool
 
 	// RevocableZone support set volcano.sh/revocable-zone annotaion or label for pod/podgroup
 	// we only support empty value or * value for this version and we will support specify revocable zone name for futrue release
@@ -340,6 +347,7 @@ func NewJobInfo(uid JobID, tasks ...*TaskInfo) *JobInfo {
 		Allocated:        EmptyResource(),
 		TotalRequest:     EmptyResource(),
 		TaskStatusIndex:  map[TaskStatus]tasksMap{},
+		TaskStatusCount:  map[TaskID]map[TaskStatus]int32{},
 		Tasks:            tasksMap{},
 		TaskMinAvailable: map[TaskID]int32{},
 	}
@@ -375,6 +383,7 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 	ji.Preemptable = ji.extractPreemptable(pg)
 	ji.RevocableZone = ji.extractRevocableZone(pg)
 	ji.Budget = ji.extractBudget(pg)
+	ji.CustomLaunch = ji.extractCustomLaunch(pg)
 
 	taskMinAvailableTotal := int32(0)
 	for task, member := range pg.Spec.MinTaskMember {
@@ -468,6 +477,16 @@ func (ji *JobInfo) extractBudget(pg *PodGroup) *DisruptionBudget {
 	return NewDisruptionBudget("", "")
 }
 
+// extractCustomLaunch return whether job has dependencies between tasks
+func (ji *JobInfo) extractCustomLaunch(pg *PodGroup) bool {
+	if sequential, found := pg.Annotations[CustomLaunch]; found {
+		if b, err := strconv.ParseBool(sequential); err == nil {
+			return b
+		}
+	}
+	return false
+}
+
 // GetMinResources return the min resources of podgroup.
 func (ji *JobInfo) GetMinResources() *Resource {
 	if ji.PodGroup.Spec.MinResources == nil {
@@ -482,6 +501,10 @@ func (ji *JobInfo) addTaskIndex(ti *TaskInfo) {
 		ji.TaskStatusIndex[ti.Status] = tasksMap{}
 	}
 	ji.TaskStatusIndex[ti.Status][ti.UID] = ti
+	if _, found := ji.TaskStatusCount[ti.GetTaskSpecKey()]; !found {
+		ji.TaskStatusCount[ti.GetTaskSpecKey()] = make(map[TaskStatus]int32)
+	}
+	ji.TaskStatusCount[ti.GetTaskSpecKey()][ti.Status]++
 }
 
 // AddTaskInfo is used to add a task to a job
@@ -518,6 +541,12 @@ func (ji *JobInfo) UpdateTaskStatus(task *TaskInfo, status TaskStatus) error {
 func (ji *JobInfo) deleteTaskIndex(ti *TaskInfo) {
 	if tasks, found := ji.TaskStatusIndex[ti.Status]; found {
 		delete(tasks, ti.UID)
+		if statusCount, found := ji.TaskStatusCount[ti.GetTaskSpecKey()]; found {
+			statusCount[ti.Status]--
+			if statusCount[ti.Status] == 0 {
+				delete(statusCount, ti.Status)
+			}
+		}
 
 		if len(tasks) == 0 {
 			delete(ji.TaskStatusIndex, ti.Status)
@@ -560,12 +589,14 @@ func (ji *JobInfo) Clone() *JobInfo {
 		PodGroup: ji.PodGroup.Clone(),
 
 		TaskStatusIndex:       map[TaskStatus]tasksMap{},
+		TaskStatusCount:       map[TaskID]map[TaskStatus]int32{},
 		TaskMinAvailable:      ji.TaskMinAvailable,
 		TaskMinAvailableTotal: ji.TaskMinAvailableTotal,
 		Tasks:                 tasksMap{},
 		Preemptable:           ji.Preemptable,
 		RevocableZone:         ji.RevocableZone,
 		Budget:                ji.Budget.Clone(),
+		CustomLaunch:          ji.CustomLaunch,
 	}
 
 	ji.CreationTimestamp.DeepCopyInto(&info.CreationTimestamp)
@@ -680,6 +711,15 @@ func (ji *JobInfo) ReadyTaskNum() int32 {
 
 // WaitingTaskNum returns the number of tasks that are pipelined.
 func (ji *JobInfo) WaitingTaskNum() int32 {
+	if ji.CustomLaunch {
+		var waitingTaskPodNum int32 = 0
+		for taskId, minAvailable := range ji.TaskMinAvailable {
+			if _, found := ji.TaskStatusCount[taskId]; !found {
+				waitingTaskPodNum += minAvailable
+			}
+		}
+		return int32(len(ji.TaskStatusIndex[Pipelined])) + waitingTaskPodNum
+	}
 	return int32(len(ji.TaskStatusIndex[Pipelined]))
 }
 
@@ -704,7 +744,11 @@ func (ji *JobInfo) CheckTaskMinAvailable() bool {
 
 	klog.V(4).Infof("job %s/%s actual: %+v, ji.TaskMinAvailable: %+v", ji.Name, ji.Namespace, actual, ji.TaskMinAvailable)
 	for task, minAvailable := range ji.TaskMinAvailable {
-		if act, ok := actual[task]; !ok || act < minAvailable {
+		act, ok := actual[task]
+		if ji.CustomLaunch && !ok {
+			continue
+		}
+		if !ok || act < minAvailable {
 			return false
 		}
 	}
@@ -736,6 +780,11 @@ func (ji *JobInfo) CheckTaskMinAvailableReady() bool {
 		}
 	}
 	for taskID, minNum := range ji.TaskMinAvailable {
+		_, found := occupiedMap[taskID]
+		// skip check for those waiting task in dag
+		if ji.CustomLaunch && !found {
+			continue
+		}
 		if occupiedMap[taskID] < minNum {
 			klog.V(4).Infof("Job %s/%s Task %s occupied %v less than task min avaliable", ji.Namespace, ji.Name, taskID, occupiedMap[taskID])
 			return false
@@ -770,7 +819,7 @@ func (ji *JobInfo) CheckTaskMinAvailablePipelined() bool {
 	}
 	for taskID, minNum := range ji.TaskMinAvailable {
 		if occupiedMap[taskID] < minNum {
-			klog.V(4).Infof("Job %s/%s Task %s occupied %v less than task min avaliable", ji.Namespace, ji.Name, taskID, occupiedMap[taskID])
+			klog.V(4).Infof("Job %s/%s Task %s occupied %v less than task min available", ji.Namespace, ji.Name, taskID, occupiedMap[taskID])
 			return false
 		}
 	}
@@ -779,6 +828,9 @@ func (ji *JobInfo) CheckTaskMinAvailablePipelined() bool {
 
 // ValidTaskNum returns the number of tasks that are valid.
 func (ji *JobInfo) ValidTaskNum() int32 {
+	if ji.CustomLaunch {
+		return ji.MinAvailable
+	}
 	occupied := 0
 	for status, tasks := range ji.TaskStatusIndex {
 		if AllocatedStatus(status) ||
@@ -794,6 +846,12 @@ func (ji *JobInfo) ValidTaskNum() int32 {
 
 // Ready returns whether job is ready for run
 func (ji *JobInfo) Ready() bool {
+	if ji.CustomLaunch {
+		if ji.CheckTaskMinAvailableReady() {
+			return true
+		}
+		return false
+	}
 	occupied := ji.ReadyTaskNum()
 
 	return occupied >= ji.MinAvailable
@@ -806,4 +864,41 @@ func (ji *JobInfo) IsPending() bool {
 	}
 
 	return false
+}
+
+// StageMinAvailable returns current stage minAvailable of job having dependent tasks
+func (ji *JobInfo) StageMinAvailable() int32 {
+	taskMap := map[TaskID]int32{}
+	for _, tasks := range ji.TaskStatusIndex {
+		for _, task := range tasks {
+			taskMap[getTaskID(task.Pod)]++
+		}
+	}
+
+	return 0
+}
+
+// GetWaitingTaskMinResources return the min resources of waiting tasks within dag.
+func (ji *JobInfo) GetWaitingTaskMinResources() *Resource {
+	taskMinAvailable := make(map[TaskID]int32)
+	for k, v := range ji.TaskMinAvailable {
+		taskMinAvailable[k] = v
+	}
+	minResources := ji.GetMinResources()
+
+	for status, tasks := range ji.TaskStatusIndex {
+		if AllocatedStatus(status) ||
+			status == Succeeded {
+			for _, task := range tasks {
+				if minNum, found := taskMinAvailable[getTaskID(task.Pod)]; !found || minNum <= 0 {
+					continue
+				}
+				taskMinAvailable[getTaskID(task.Pod)]--
+				minResources.sub(GetPodResourceWithoutInitContainers(task.Pod))
+			}
+			break
+		}
+	}
+
+	return minResources
 }
