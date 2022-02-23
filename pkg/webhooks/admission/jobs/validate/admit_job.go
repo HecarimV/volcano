@@ -111,6 +111,7 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *v1beta1.AdmissionRespo
 	var msg string
 	taskNames := map[string]string{}
 	var totalReplicas int32
+	var taskMinAvailableTotal int32
 
 	if job.Spec.MinAvailable < 0 {
 		reviewResponse.Allowed = false
@@ -148,6 +149,13 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *v1beta1.AdmissionRespo
 
 		// count replicas
 		totalReplicas += task.Replicas
+
+		// count taskMinAvailableTotal
+		if task.MinAvailable != nil {
+			taskMinAvailableTotal += *task.MinAvailable
+		} else {
+			taskMinAvailableTotal += task.Replicas
+		}
 
 		// validate task name
 		if errMsgs := validation.IsDNS1123Label(task.Name); len(errMsgs) > 0 {
@@ -207,6 +215,9 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *v1beta1.AdmissionRespo
 		_, isDag := topoSort(job)
 		if !isDag {
 			msg += "job has dependencies between tasks, but doesn't form a directed acyclic graph(DAG)"
+		}
+		if taskMinAvailableTotal > job.Spec.MinAvailable {
+			msg += fmt.Sprintf("in order to finish task dag, job 'minAvailable' cannot be less than taskMinAvailableTotal: %v", taskMinAvailableTotal)
 		}
 	}
 

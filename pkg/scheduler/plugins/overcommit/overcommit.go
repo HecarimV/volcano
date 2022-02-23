@@ -91,7 +91,11 @@ func (op *overcommitPlugin) OnSessionOpen(ssn *framework.Session) {
 	// calculate inqueue job resources
 	for _, job := range ssn.Jobs {
 		if job.PodGroup.Status.Phase == scheduling.PodGroupInqueue && job.PodGroup.Spec.MinResources != nil {
-			op.inqueueResource.Add(api.NewResource(*job.PodGroup.Spec.MinResources))
+			if !job.CustomLaunch {
+				op.inqueueResource.Add(job.GetMinResources())
+			} else {
+				op.inqueueResource.Add(job.GetWaitingTaskMinResources())
+			}
 		}
 	}
 

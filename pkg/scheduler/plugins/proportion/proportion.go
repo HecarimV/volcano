@@ -138,7 +138,11 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 
 		if job.PodGroup.Status.Phase == scheduling.PodGroupInqueue {
-			attr.inqueue.Add(job.GetMinResources())
+			if !job.CustomLaunch {
+				attr.inqueue.Add(job.GetMinResources())
+			} else {
+				attr.inqueue.Add(job.GetWaitingTaskMinResources())
+			}
 		}
 	}
 
@@ -319,6 +323,7 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 			attr.inqueue.Add(job.GetMinResources())
 			return util.Permit
 		}
+
 		return util.Reject
 	})
 
